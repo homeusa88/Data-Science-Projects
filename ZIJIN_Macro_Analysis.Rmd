@@ -1,0 +1,205 @@
+---
+title: "ZIJINMacroMarket_Analysis"
+author: "Michael Yoo"
+date: "2025-09-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Set Working Directory
+setwd("~/Documents/Projects/Gold Proxy and Forecast Project")
+```
+
+
+```{r}
+#list packages
+packages <- c("vars", "car", "ggplot2", "dplyr", "tidyr", "tidyverse", "tidyquant", "lubridate", "xts", "zoo", "tseries", "urca", "vars", "forecast", "lmtest", "sandwich")
+#reference them
+invisible(lapply(packages,library,character.only = TRUE))
+```
+
+
+```{r}
+#Data pull from Yahoo Finance
+#List of Tickers
+tickers <- c("SPY", "GDX", "GLD", "^VIX", "^TNX", "2899.HK")
+#read in data, wide format
+prices <- tq_get(tickers, from = as.Date("2012-01-01"), to = Sys.Date(), get = "stock.prices") %>%
+  dplyr::select(symbol, date, adjusted) %>%
+  tidyr::pivot_wider(names_from = symbol, values_from = adjusted) %>%
+  arrange(date)
+```
+
+
+```{r}
+#Data processing
+df <- prices %>% drop_na() %>% rename(
+  GOLD  = GLD,
+  VIX   = `^VIX`,
+  TNX   = `^TNX`,
+  ZIJIN = `2899.HK`
+)
+col_name <- c("SPY", "GOLD", "GDX", "VIX", "TNX", "ZIJIN")
+#test for stationarity using Augmented Dickey Fuller
+print(lapply(df[col_name], function(x) adf.test(x)$p.value))
+#p-val > 0.05 means cannot claim stationarity
+#Based on results, all non-stationary excluding VIX
+```
+
+
+```{r}
+#Chart Pre Transformation
+df %>%
+  pivot_longer(cols = -date, names_to = "series", values_to = "value") %>%
+  ggplot(aes(x = date, y = value, color = series)) +
+  geom_line(show.legend = FALSE) +
+  facet_wrap(~series, scales = "free_y", ncol = 1) +
+  labs(title = "Original Series (Levels)", x = "Date", y = "Value")
+```
+
+
+```{r}
+#First differencing with logs, better behavior for equities
+df_ret <- df %>% transmute(date = date,
+                        r_SPY = log(SPY) - log(lag(SPY)), 
+                        r_GOLD  = log(GOLD) - log(lag(GOLD)),   # log returns
+                        r_ZIJIN = log(ZIJIN) - log(lag(ZIJIN)),
+                        r_GDX = log(GDX) - log(lag(GDX)),
+                        d_TNX   = TNX - lag(TNX),               # first difference
+                        d_VIX = VIX-lag(VIX))
+#TNX already in percent, yields do not compound, only need to difference
+```
+
+
+```{r}
+#Graph after Transformation
+df_ret %>%
+  pivot_longer(cols = -date, names_to = "series", values_to = "value") %>%
+  ggplot(aes(x = date, y = value, color = series)) +
+  geom_line(show.legend = FALSE) +
+  facet_wrap(~series, scales = "free_y", ncol = 1) +
+  labs(title = "Transformed Series (Returns / Differences)", x = "Date", y = "Value")
+
+```
+
+
+```{r}
+#Create DF with lags
+k <- 2
+for (i in 1:k) {
+  # For each i, create lagged column
+  df_ret[[paste0("r_SPY_L", i)]]  <- dplyr::lag(df_ret$r_SPY,  n = i)
+  df_ret[[paste0("r_GDX_L", i)]]  <- dplyr::lag(df_ret$r_GDX,  n = i)
+  df_ret[[paste0("r_GOLD_L", i)]]  <- dplyr::lag(df_ret$r_GOLD,  n = i)
+  #df_ret[[paste0("d_TNX_L", i)]]   <- dplyr::lag(df_ret$d_TNX,   n = i)
+  df_ret[[paste0("d_VIX_L", i)]]     <- dplyr::lag(df_ret$d_VIX,     n = i)
+  df_ret[[paste0("r_ZIJIN_L", i)]] <- dplyr::lag(df_ret$r_ZIJIN, n = i)
+}
+lagged_vars <- c(
+  paste0("r_ZIJIN_L", 1:k),
+  paste0("r_GOLD_L",  1:k),
+  #paste0("d_TNX_L",   1:k),
+  paste0("d_VIX_L",   1:k),
+  paste0("r_SPY_L",   1:k),
+  paste0("r_GDX_L",   1:k)
+)
+#drop na values, lost observations
+df_ret <- df_ret %>% drop_na()
+```
+
+
+```{r}
+#train test split
+start_date <- min(df_ret$date)
+#10 years training data
+split_date <- start_date +lubridate::years(10)
+train_df_ret <- df_ret %>% filter(date < split_date)
+test_df_ret <- df_ret %>% filter(date >= split_date)
+```
+
+```{r}
+#Correlation Check
+corr_train <- cor(train_df_ret[2:16])
+```
+
+
+```{r}
+#Baseline Model
+base_model <- lm(r_ZIJIN ~ r_ZIJIN_L1 + r_GDX_L1 + r_GOLD_L1 + d_VIX_L1 + r_SPY_L1, data = train_df_ret)
+summary(base_model)
+vif(base_model)
+```
+
+
+```{r}
+#Model with ALL Lags (exploratory)
+form <- as.formula(paste("r_ZIJIN ~", paste(lagged_vars, collapse = " + ")))
+model_L <- lm(form, data = train_df_ret)
+summary(model_L)
+vif(model_L)
+```
+
+
+```{r}
+#Testing Models
+training_model <- model_L
+insample_R2     <- summary(training_model)$r.squared
+insample_R2_adj <- summary(training_model)$adj.r.squared
+```
+
+```{r}
+y_test <- test_df_ret$r_ZIJIN
+yhat_test <- predict(training_model, newdata = test_df_ret)
+
+#Calculating Out of Sample R^2
+ybar_train <- mean(train_df_ret$r_ZIJIN)
+
+SSE_test <- sum((y_test - yhat_test)^2, na.rm = TRUE)
+SST_test <- sum((y_test - ybar_train)^2, na.rm = TRUE)
+
+oos_R2 <- 1 - SSE_test / SST_test
+oos_R2_testMean <- 1 - SSE_test / sum((y_test - mean(y_test))^2, na.rm = TRUE)
+
+#Error Metrics
+RMSE <- sqrt(mean((y_test - yhat_test)^2, na.rm = TRUE))
+MAE  <- mean(abs(y_test - yhat_test), na.rm = TRUE)
+```
+
+
+```{r}
+#Printing Results
+tibble(
+  InSample_R2 = insample_R2,
+  InSample_R2_Adj = insample_R2_adj,
+  OOS_R2_TrainMean = oos_R2,
+  OOS_R2_TestMean  = oos_R2_testMean,
+  OOS_RMSE = RMSE,
+  OOS_MAE  = MAE
+)
+```
+
+
+Summary of Findings
+In this analysis, I set out to investigate the drivers of Zijin Mining’s daily stock returns using a time-series regression framework. My objective was to analyze whether lagged values of Zijin’s own returns, along with external market and commodity variables, could provide out-of-sample predictive power. Specifically, I incorporated lagged gold returns (GLD), mining sector ETF returns (GDX), changes in implied volatility (VIX), and the S&P 500 (SPY). The analysis was conducted on data sourced from Yahoo Finance, split into a training window of the first ten years and a test window covering the remaining observations up to today.
+
+Methodlogy
+I began with two basic models for simplicity. The first being a simple L1 model, incorporating one lag for Zijin, GLD, GDX, VIX, and SPY. The goal was to get a general sense of the behavior of these different variables in relation to Zijin's current returns.
+
+The next model was a simple L1, L2 model, which incorpated two lags for each variable to see potential persistence effects. Both models were estimated using OLS with OLS assumptions. I evaluated both the in sample R^2 and out of sample R^2, along with RMSE and MAE. I computed variance inflation factors (VIFs) to monitor for multicollinerarity. 
+
+During this time, it was found that Treasury yields provided no predicitve value.
+
+Results
+The extended model showed a 0.015 improvement in the R^2, marginal, and performed realtively well on in-sample vs out-of-sample data. Some significant indicators included, both the lags of Zijin itself, mean reversion followed by a partial rebound, along with gold itself, which was a strong leading indicator. Naturally, both gold and gold ETFs were strong explanatory variables in future Zijin prices, as they are the macro indicators for the gold market. Finally, we see that the VIX displays a persistent drag.
+
+These results create a cohesive story. Zijin's mining daily returns can be connected to commoditidy momentum (gold prices), and secotr dynamics. It is worth noting that rsik sentiment (VIX), did not play the role I expected it to in the case of gold. I hypothesized that if the VIX rose, in the case of shaken confidence in the market, investors would shift towards gold. However, this was proven incorrect. There may be more nuance to the situation, as it is likely that daily shifts in VIX would not be enough to incentivize investors to move funds immediatly to gold. 
+
+my takeaway is that this exercise confirms the value of a structured time-series framework. I have shown that Zijin returns are predictable to some degree using commodity, sector, and volatility proxies, achieving an out-of-sample R^2 of roughly 15%—a meaningful result in the context of noisy daily stock returns. The extended lag model modestly improves explanatory power, but the simpler one-lag specification remains competitive and easier to interpret. Going forward, I would test whether these relationships strengthen at a weekly frequency and explore regularized regression (ridge or elastic net) to balance lag structure with robustness.
+
+
+
+
